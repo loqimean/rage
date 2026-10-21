@@ -111,6 +111,9 @@ class Rage::Daemon
   BACKOFF_RESET_INTERVAL = 30
   private_constant :BACKOFF_RESET_INTERVAL
 
+  RELOAD_CHECK_INTERVAL = 1_000
+  private_constant :RELOAD_CHECK_INTERVAL
+
   class << self
     # @private
     attr_accessor :__level
@@ -156,10 +159,77 @@ class Rage::Daemon
       end
     end
 
+    # @private
+    # Development only. Stop the running daemon so that its reloaded version can take over.
+    def __stop
+      @__stopping = true
+      @__fiber&.kill
+    end
+
+    # @private
+    def __running?
+      !!@__fiber&.alive?
+    end
+
+    # @private
+    # Development only. Whether the file that defines the daemon changed since the daemon started.
+    def __source_changed?
+      !!@__source_file && File.exist?(@__source_file) && File.mtime(@__source_file) != @__source_mtime
+    end
+
+    # @private
+    # Development only. Restart daemons whose source files changed using their reloaded versions.
+    # If the reloaded version fails to load, the previous version keeps running.
+    def __reload_changed
+      klasses = Rage.config.daemons.klasses
+
+      klasses.each_with_index do |klass, i|
+        next unless klass.__running? && klass.__source_changed?
+
+        new_klass = begin
+          Object.const_get(klass.name)
+        rescue ScriptError, StandardError => e
+          Rage.logger.error("Failed to reload daemon #{klass.name}, keeping the previous version running: #{e.class} (#{e.message})")
+          Rage::Errors.report(e)
+          next
+        end
+
+        if !new_klass.is_a?(Class) || !new_klass.ancestors.include?(Rage::Daemon)
+          Rage.logger.error("Failed to reload daemon #{klass.name}, keeping the previous version running: `#{klass.name}` no longer inherits `Rage::Daemon`")
+          next
+        end
+
+        next if new_klass.equal?(klass) # the class wasn't reloaded
+
+        Rage.logger.info("Reloading daemon #{klass.name}")
+        klass.__stop
+        klasses[i] = new_klass
+        # call `__execute` directly - the daemon already runs in this process and
+        # `Rage::Internal.pick_a_worker` would fail to re-acquire the lock held by the previous version
+        new_klass.__send__(:__execute)
+      end
+    end
+
+    # @private
+    # Development only. Reload daemons when their source files change, even if the server receives no requests.
+    def __setup_reloading
+      Rage.config.after_reload { Rage::Daemon.__reload_changed }
+      Iodine.run_every(RELOAD_CHECK_INTERVAL) do
+        Rage.code_loader.reload if Rage.code_loader.check_updated!
+      rescue => e
+        Rage.logger.error("Failed to reload code: #{e.class} (#{e.message})")
+      end
+    end
+
     private
 
     def __execute
-      f = Fiber.schedule do
+      if Rage.env.development?
+        @__source_file = Object.const_source_location(name)&.first
+        @__source_mtime = File.mtime(@__source_file) if @__source_file && File.exist?(@__source_file)
+      end
+
+      @__fiber = f = Fiber.schedule do
         backoff = INITIAL_BACKOFF
 
         Rage.logger.with_context(daemon: name) do
@@ -241,4 +311,5 @@ end
 Iodine.on_state(:on_start) do
   Fiber.set_scheduler(Rage::FiberScheduler.new) unless Fiber.scheduler
   Rage.config.daemons.klasses.each { |klass| klass.__perform }
+  Rage::Daemon.__setup_reloading if Rage.env.development? && Rage.config.daemons.klasses.any?
 end
