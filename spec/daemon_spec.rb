@@ -349,4 +349,155 @@ RSpec.describe Rage::Daemon do
       end
     end
   end
+
+  context "with reloading" do
+    let(:daemon) do
+      Class.new(Rage::Daemon) do
+        def perform
+          loop do
+            validator.tick
+            sleep 0.1
+          end
+        end
+
+        def cleanup
+          validator.cleanup
+        end
+      end
+    end
+
+    let(:new_daemon) do
+      Class.new(Rage::Daemon) do
+        def perform
+          validator.reloaded_perform
+          Rage::Daemon::Stop
+        end
+      end
+    end
+
+    let(:klasses) { [daemon] }
+
+    before do
+      allow(Rage.config.daemons).to receive(:klasses).and_return(klasses)
+      allow(new_daemon).to receive(:name).and_return(:TestDaemon)
+      allow_any_instance_of(new_daemon).to receive(:validator).and_return(validator)
+      allow(Object).to receive(:const_get).and_call_original
+    end
+
+    context "when the source file changed" do
+      before do
+        allow(daemon).to receive(:__source_changed?).and_return(true)
+      end
+
+      it "restarts the daemon with the reloaded class" do
+        within_reactor do
+          subject
+          sleep 0.2
+
+          allow(Object).to receive(:const_get).with(:TestDaemon).and_return(new_daemon)
+          Rage::Daemon.__reload_changed
+          sleep 0.2
+
+          -> do
+            expect(validator).to have_received(:cleanup).once
+            expect(validator).to have_received(:reloaded_perform).once
+            expect(daemon.__running?).to be(false)
+            expect(klasses).to eq([new_daemon])
+          end
+        end
+      end
+
+      it "keeps the previous version running if the reloaded file fails to load" do
+        within_reactor do
+          subject
+          sleep 0.2
+
+          allow(Object).to receive(:const_get).with(:TestDaemon).and_raise(SyntaxError, "unexpected end-of-input")
+          Rage::Daemon.__reload_changed
+          sleep 0.2
+          # capture the state before the reactor stops and shuts the daemons down
+          running = daemon.__running?
+
+          -> do
+            expect(validator).not_to have_received(:reloaded_perform)
+            expect(running).to be(true)
+            expect(klasses).to eq([daemon])
+          end
+        end
+      end
+
+      it "reports the load error" do
+        within_reactor do
+          subject
+          sleep 0.2
+
+          allow(Object).to receive(:const_get).with(:TestDaemon).and_raise(SyntaxError, "unexpected end-of-input")
+          expect(Rage::Errors).to receive(:report).with(instance_of(SyntaxError))
+          Rage::Daemon.__reload_changed
+          running = daemon.__running?
+
+          -> { expect(running).to be(true) }
+        end
+      end
+
+      it "keeps the previous version running if the reloaded constant is not a daemon" do
+        within_reactor do
+          subject
+          sleep 0.2
+
+          allow(Object).to receive(:const_get).with(:TestDaemon).and_return(Class.new)
+          Rage::Daemon.__reload_changed
+          sleep 0.2
+          running = daemon.__running?
+
+          -> do
+            expect(running).to be(true)
+            expect(klasses).to eq([daemon])
+          end
+        end
+      end
+    end
+
+    context "when the source file didn't change" do
+      before do
+        allow(daemon).to receive(:__source_changed?).and_return(false)
+      end
+
+      it "doesn't restart the daemon" do
+        within_reactor do
+          subject
+          sleep 0.2
+
+          Rage::Daemon.__reload_changed
+          sleep 0.2
+          running = daemon.__running?
+
+          -> do
+            expect(Object).not_to have_received(:const_get).with(:TestDaemon)
+            expect(running).to be(true)
+            expect(klasses).to eq([daemon])
+          end
+        end
+      end
+    end
+
+    describe ".__source_changed?" do
+      let(:file) { Tempfile.new(["daemon", ".rb"]) }
+
+      after { file.close! }
+
+      it "detects file modifications" do
+        daemon.instance_variable_set(:@__source_file, file.path)
+        daemon.instance_variable_set(:@__source_mtime, File.mtime(file.path))
+        expect(daemon.__source_changed?).to be(false)
+
+        File.utime(Time.now + 10, Time.now + 10, file.path)
+        expect(daemon.__source_changed?).to be(true)
+      end
+
+      it "returns false if the source file is unknown" do
+        expect(daemon.__source_changed?).to be(false)
+      end
+    end
+  end
 end
