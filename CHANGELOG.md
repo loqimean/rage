@@ -2,6 +2,12 @@
 
 ### Added
 
+- [Daemon] Reload daemons in development when their source files change (#418).
+
+## [1.29.0] - 2026-10-23
+
+### Added
+
 - [Deferred] Add `Rage::Deferred.dead_tasks` for listing and inspecting tasks that exhausted their retries.
 - Add low-level `PubSub` API (#399).
 - [Cable] Serialize WS messages per connection (#400).
